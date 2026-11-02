@@ -512,7 +512,10 @@ export class ExtensionManagementService
 					this.userDataProfileService.currentProfile.extensionsResource
 				);
 			}
-			throw new Error('Local extension management server is not found');
+			// SideX persists local extensions through its web management server.
+			if ((globalThis as any).__SIDEX_TAURI__ !== true) {
+				throw new Error('Local extension management server is not found');
+			}
 		}
 		if (location.scheme === Schemas.vscodeRemote) {
 			if (this.extensionManagementServerService.remoteExtensionManagementServer) {

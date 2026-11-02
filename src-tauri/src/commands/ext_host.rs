@@ -14,6 +14,42 @@ use tauri::AppHandle;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+/// Stop only the tree belonging to this session. On Unix the server is its
+/// own process-group leader, so even an unresponsive host cannot orphan its
+/// language servers. Closing stdin first lets the Node cleanup run normally.
+fn stop_host_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        drop(child.stdin.take());
+        // Node cleanup can take two 2-second process snapshots before killing
+        // detached descendants. Give it that budget before killing the group.
+        let deadline = Instant::now() + Duration::from_millis(5_000);
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Ok(pid) = i32::try_from(child.id()) {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Keep the parent alive until taskkill has captured its descendants.
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .creation_flags(0x0800_0000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Strip the Windows `\\?\` prefix; Node's CJS resolver chokes on UNC paths.
 fn normalize_for_node(path: PathBuf) -> PathBuf {
@@ -82,6 +118,7 @@ impl ExtensionPlatformSupervisor {
             if session.child.try_wait().ok().flatten().is_none() {
                 return Ok(session.port);
             }
+            stop_host_process(&mut session.child);
             guard.total_crashes += 1;
             guard.session = None;
         }
@@ -102,8 +139,7 @@ impl ExtensionPlatformSupervisor {
     pub fn stop(&self) -> Result<(), String> {
         let mut guard = self.inner.lock().map_err(|e| e.to_string())?;
         if let Some(mut session) = guard.session.take() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
+            stop_host_process(&mut session.child);
             log::info!("[ext-host] stopped");
         }
         Ok(())
@@ -139,6 +175,12 @@ impl ExtensionPlatformSupervisor {
                 total_crashes: guard.total_crashes,
             }),
         }
+    }
+}
+
+impl Drop for ExtensionPlatformSupervisor {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -285,15 +327,17 @@ fn spawn_host_process(
     {
         child_cmd.creation_flags(0x0800_0000);
     }
+    #[cfg(unix)]
+    child_cmd.process_group(0);
 
     let mut child = child_cmd
         .spawn()
         .map_err(|e| format!("failed to spawn extension host: {e}"))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("failed to capture extension host stdout")?;
+    let Some(stdout) = child.stdout.take() else {
+        stop_host_process(&mut child);
+        return Err("failed to capture extension host stdout".into());
+    };
 
     let stderr_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(stderr) = child.stderr.take() {
@@ -319,14 +363,13 @@ fn spawn_host_process(
         }
     };
 
-    let port = {
+    let port = (|| -> Result<u16, String> {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let bytes_read = reader
             .read_line(&mut line)
             .map_err(|e| format!("failed to read extension host port: {e}{}", recent_stderr()))?;
         if bytes_read == 0 {
-            let _ = child.kill();
             return Err(format!(
                 "extension host exited before sending port message (init_data_file={}).{}",
                 init_data_file.display(),
@@ -341,7 +384,15 @@ fn spawn_host_process(
                 recent_stderr()
             )
         })?;
-        msg.port
+        Ok(msg.port)
+    })();
+    let port = match port {
+        Ok(port) => port,
+        Err(error) => {
+            stop_host_process(&mut child);
+            let _ = std::fs::remove_file(&init_data_file);
+            return Err(error);
+        }
     };
 
     log::info!("extension host started on port {port} (session={session_id})");
@@ -397,8 +448,7 @@ fn ensure_session(guard: &mut SupervisorState, app: &AppHandle) -> Result<(), St
 
 #[allow(dead_code)]
 fn kill_session(session: &mut ExtHostSession) {
-    let _ = session.child.kill();
-    let _ = session.child.wait();
+    stop_host_process(&mut session.child);
     log::info!(
         "extension host stopped (session={}, uptime={}s)",
         session.session_id,

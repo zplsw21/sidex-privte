@@ -12,6 +12,15 @@ import * as strings from '../strings.js';
 
 const DEFAULT_CHANNEL = 'default';
 const INITIALIZE = '$initialize';
+// This timeout covers only the initialization handshake, not regular RPCs.
+const WORKER_INITIALIZATION_TIMEOUT_MS = 30_000;
+
+// Unlike a remote method exception, a failed transport can be retried locally.
+export class WorkerTransportError extends Error {
+	constructor(error: unknown) {
+		super(error && typeof error === 'object' && 'message' in error ? String(error.message) : 'Web worker failed');
+	}
+}
 
 export interface IWebWorker extends IDisposable {
 	getId(): number;
@@ -103,6 +112,7 @@ class WebWorkerProtocol {
 	private _workerId: number;
 	private _lastSentReq: number;
 	private _pendingReplies: { [req: string]: IMessageReply };
+	private _workerError: Error | undefined;
 	private _pendingEmitters: Map<string, Emitter<unknown>>;
 	private _pendingEvents: Map<string, IDisposable>;
 	private _handler: IMessageHandler;
@@ -121,6 +131,9 @@ class WebWorkerProtocol {
 	}
 
 	public async sendMessage(channel: string, method: string, args: unknown[]): Promise<unknown> {
+		if (this._workerError) {
+			throw this._workerError;
+		}
 		const req = String(++this._lastSentReq);
 		return new Promise<unknown>((resolve, reject) => {
 			this._pendingReplies[req] = {
@@ -129,6 +142,19 @@ class WebWorkerProtocol {
 			};
 			this._send(new RequestMessage(this._workerId, req, channel, method, args));
 		});
+	}
+
+	public handleWorkerError(error: unknown): void {
+		if (this._workerError) {
+			return;
+		}
+		const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : 'Web worker failed';
+		this._workerError = error instanceof Error ? error : new Error(message);
+		for (const req of Object.keys(this._pendingReplies)) {
+			const reply = this._pendingReplies[req];
+			delete this._pendingReplies[req];
+			reply.reject(this._workerError);
+		}
 	}
 
 	public listen(channel: string, eventName: string, arg: unknown): Event<unknown> {
@@ -332,12 +358,6 @@ export class WebWorkerClient<W extends object> extends Disposable implements IWe
 				this._protocol.handleMessage(msg);
 			})
 		);
-		this._register(
-			this._worker.onError(err => {
-				logOnceWebWorkerWarning(err);
-				onUnexpectedError(err);
-			})
-		);
 
 		this._protocol = new WebWorkerProtocol({
 			sendMessage: (msg: Message, transfer: ArrayBuffer[]): void => {
@@ -351,11 +371,31 @@ export class WebWorkerClient<W extends object> extends Disposable implements IWe
 			}
 		});
 		this._protocol.setWorkerId(this._worker.getId());
+		this._register(
+			this._worker.onError(err => {
+				this._protocol.handleWorkerError(new WorkerTransportError(err));
+				this._worker.dispose();
+				logOnceWebWorkerWarning(err);
+				onUnexpectedError(err);
+			})
+		);
 
-		// Send initialize message
+		// A startup error or silent handshake failure must reject the barrier so
+		// callers can use their existing local-worker fallback.
+		const initializeTimer = setTimeout(() => {
+			this._protocol.handleWorkerError(new Error(`Worker initialization timed out after ${WORKER_INITIALIZATION_TIMEOUT_MS}ms`));
+			this._worker.dispose();
+		}, WORKER_INITIALIZATION_TIMEOUT_MS);
+		this._register({ dispose: () => {
+			clearTimeout(initializeTimer);
+			this._protocol.handleWorkerError(new Error('Worker disposed'));
+		} });
 		this._onModuleLoaded = this._protocol
 			.sendMessage(DEFAULT_CHANNEL, INITIALIZE, [this._worker.getId()])
-			.then(() => {});
+			.then(() => { clearTimeout(initializeTimer); }, error => {
+				clearTimeout(initializeTimer);
+				throw error;
+			});
 
 		this.proxy = this._protocol.createProxyToRemoteChannel(DEFAULT_CHANNEL, async () => {
 			await this._onModuleLoaded;

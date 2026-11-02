@@ -9,7 +9,10 @@
 //! - Memory-efficient with proper Arc/Mutex usage
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind};
+
+#[path = "watch_backend.rs"]
+mod watch_backend;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::AbortHandle;
+use watch_backend::{WatchBackend, WatchRegistration};
 
 /// Maximum file size to read content for (100KB)
 const MAX_FILE_CONTENT_SIZE: u64 = 100 * 1024;
@@ -47,14 +51,6 @@ impl WatchOptions {
 
     fn should_emit_content(&self) -> bool {
         self.emit_content.unwrap_or(false)
-    }
-
-    fn recursive_mode(&self) -> RecursiveMode {
-        if self.recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        }
     }
 }
 
@@ -95,9 +91,9 @@ struct WatchSession {
     /// Paths being watched (kept for reference)
     #[allow(dead_code)]
     paths: Vec<PathBuf>,
-    /// The notify watcher instance (kept alive for the duration of the session)
+    /// Shared native watcher subscription (released when the session is dropped)
     #[allow(dead_code)]
-    watcher: RecommendedWatcher,
+    registration: WatchRegistration,
     /// Globset for ignore patterns
     ignore_globset: Option<GlobSet>,
     /// File extensions to include (None = all, kept for reference)
@@ -123,6 +119,12 @@ pub enum DebounceStopper {
     Channel(UnboundedSender<()>),
 }
 
+impl Drop for DebounceStopper {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl DebounceStopper {
     pub fn stop(&self) {
         match self {
@@ -140,6 +142,7 @@ pub struct WatchStore {
     sessions: Mutex<HashMap<u32, WatchSession>>,
     /// Counter for generating unique watch IDs
     next_id: Mutex<u32>,
+    backend: WatchBackend,
 }
 
 impl WatchStore {
@@ -147,6 +150,7 @@ impl WatchStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
+            backend: WatchBackend::default(),
         }
     }
 
@@ -443,7 +447,7 @@ pub async fn watch_start(
     // Extract options before moving values
     let emit_content = options.should_emit_content();
     let debounce_duration = options.debounce_duration();
-    let recursive_mode = options.recursive_mode();
+    let recursive = options.recursive;
 
     // Build ignore globset
     let ignore_globset =
@@ -466,10 +470,11 @@ pub async fn watch_start(
 
     let sender_clone = event_sender.clone();
 
-    // Create the notify watcher
-    let mut watcher = RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
+    // Logical sessions share native streams, retaining their own event filters.
+    let registration =
+        state
+            .backend
+            .subscribe(watch_id, &valid_paths, recursive, move |event: Event| {
                 // Process each path in the event
                 for path in &event.paths {
                     // Skip ignored paths
@@ -494,23 +499,12 @@ pub async fn watch_start(
 
                     let _ = sender_clone.send(pending);
                 }
-            }
-        },
-        Config::default(),
-    )
-    .map_err(|e| format!("Failed to create watcher: {e}"))?;
-
-    // Watch all paths
-    for path in &valid_paths {
-        watcher
-            .watch(path, recursive_mode)
-            .map_err(|e| format!("Failed to watch '{}': {}", path.display(), e))?;
-    }
+            })?;
 
     // Store the session
     let session = WatchSession {
         paths: valid_paths,
-        watcher,
+        registration,
         ignore_globset,
         file_extensions,
         emit_content,
@@ -531,9 +525,8 @@ pub fn watch_stop(state: State<'_, Arc<WatchStore>>, id: u32) -> Result<(), Stri
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
 
     if let Some(session) = sessions.remove(&id) {
-        // Abort the debounce task
-        session.debounce_task.stop();
-        // The watcher and other resources are dropped automatically
+        // Dropping the session releases its native subscription and debounce task.
+        drop(session);
         Ok(())
     } else {
         Err(format!("Watch session {id} not found"))

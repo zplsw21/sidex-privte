@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const cp = require('child_process');
+const { installProcessCleanup } = require('./process-lifecycle.cjs');
 
 // ── RFC 6455 WebSocket helpers (zero dependencies) ──────────────────────
 
@@ -265,6 +266,8 @@ class ExtensionHostManager {
 // ── WebSocket Connection Handler ────────────────────────────────────────
 
 const hostManager = new ExtensionHostManager();
+// Rust owns our stdin pipe; EOF also covers a crash/forced exit of the app.
+installProcessCleanup(() => hostManager.shutdown(), { stdin: true });
 
 function handleUpgrade(req, socket) {
   const key = req.headers['sec-websocket-key'];
@@ -677,17 +680,6 @@ async function main() {
     log(`listening on 127.0.0.1:${port} (session=${process.env.SIDEX_SESSION_ID || 'unknown'})`);
   });
 
-  const shutdown = () => {
-    log('shutting down');
-    hostManager.shutdown();
-    server.close();
-    process.exit(0);
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-  process.stdin.resume();
-  process.stdin.on('end', shutdown);
 }
 
 main().catch((err) => {

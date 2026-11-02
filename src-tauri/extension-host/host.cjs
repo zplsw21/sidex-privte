@@ -5,8 +5,22 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { EventEmitter } = require('events');
 const crypto = require('crypto');
+const { installProcessCleanup, isBrokenPipe } = require('./process-lifecycle.cjs');
+
+let shutdownHost = () => process.exit(0);
+
+function sendHostMessage(message) {
+  if (!process.connected) return;
+  process.send(message, (error) => {
+    if (error) shutdownHost();
+  });
+}
 
 process.on('uncaughtException', (err) => {
+  if (isBrokenPipe(err)) {
+    shutdownHost();
+    return;
+  }
   try {
     process.stderr.write(`[ext-host] uncaught exception: ${err?.stack || err?.message || String(err)}\n`);
   } catch {}
@@ -20,6 +34,11 @@ function uriPathToFsPath(uriPath) {
     return uriPath.slice(1).replace(/\//g, '\\');
   }
   return uriPath;
+}
+
+function encodeWebviewResourcePath(uriPath) {
+  return uriPath.split('/').map(segment => encodeURIComponent(segment)
+    .replace(/[!'()*]/g, char => '%' + char.charCodeAt(0).toString(16).toUpperCase())).join('/');
 }
 
 const VSCODE_RESOURCE_RE = /https:\/\/file\+[^.]*\.vscode-resource\.vscode-cdn\.net(\/[^"')\s]*)/g;
@@ -334,7 +353,14 @@ class ExtensionHost extends EventEmitter {
       this._extensionPaths = params.extensionPaths;
     }
     if (params && params.workspaceFolders) {
+      const previous = this._workspaceFolders;
       this._workspaceFolders = params.workspaceFolders;
+      const toFolder = (folder, index) => ({ uri: VscUri.file(folder), name: path.basename(folder), index });
+      const added = this._workspaceFolders.map(toFolder).filter(folder => !previous.includes(folder.uri.fsPath));
+      const removed = previous.map(toFolder).filter(folder => !this._workspaceFolders.includes(folder.uri.fsPath));
+      if (added.length || removed.length) {
+        this._onWorkspaceFoldersChangeEvent?.fire({ added, removed });
+      }
     }
     return {
       id,
@@ -668,14 +694,28 @@ class ExtensionHost extends EventEmitter {
   }
 
   _handleFileWatchEvent(id, params) {
-    const { events } = params;
+    const { events, watcherId } = params;
     if (!events || !Array.isArray(events)) return { id, result: true };
+    const watchers = watcherId === undefined
+      ? this._fileWatchers
+      : new Map([[watcherId, this._fileWatchers.get(watcherId)]]);
     for (const event of events) {
       const filePath = event.path;
+      if (typeof filePath !== 'string') continue;
       const kind = event.kind;
       const uri = VscUri.file(filePath);
-      for (const [, watcher] of this._fileWatchers) {
-        if (!this._matchGlob(watcher.pattern, filePath)) continue;
+      for (const [, watcher] of watchers) {
+        if (!watcher) continue;
+        const bases = watcher.base ? [watcher.base] : this._workspaceFolders;
+        const relativePaths = bases.map(base => path.relative(base, filePath))
+          .filter(relative => relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative));
+        if (!relativePaths.length) continue;
+        // Tagged events have already passed the workbench's canonical glob
+        // matcher. Keep a literal-name guard here as well as the base check.
+        if (watcherId === undefined || !/[*?\[\]{}]/.test(watcher.pattern)) {
+          const candidates = !watcher.base && path.isAbsolute(watcher.pattern) ? [filePath] : relativePaths;
+          if (!candidates.some(candidate => this._matchGlob(watcher.pattern, candidate.replace(/\\/g, '/')))) continue;
+        }
         if (kind === 'created') watcher.onCreate.fire(uri);
         else if (kind === 'modified') watcher.onChange.fire(uri);
         else if (kind === 'deleted') watcher.onDelete.fire(uri);
@@ -690,12 +730,13 @@ class ExtensionHost extends EventEmitter {
     if (!pattern || pattern === '**' || pattern === '**/*') return true;
     const patternStr = typeof pattern === 'string' ? pattern : pattern.pattern || String(pattern);
     if (patternStr === '**' || patternStr === '**/*') return true;
+    if (!/[*?\[\]{}]/.test(patternStr)) return filePath === patternStr;
     const ext = patternStr.match(/\*\*\/\*\.(\w+)$/);
     if (ext) return filePath.endsWith('.' + ext[1]);
     const extOnly = patternStr.match(/^\*\.(\w+)$/);
     if (extOnly) return filePath.endsWith('.' + extOnly[1]);
     if (patternStr.includes('/')) return filePath.includes(patternStr.replace(/\*\*/g, '').replace(/\*/g, ''));
-    return true;
+    return filePath === patternStr;
   }
 
   _makeTextEditorProxy(uri) {
@@ -1085,7 +1126,7 @@ class ExtensionHost extends EventEmitter {
             query: localUri.query || '',
             fragment: localUri.fragment || '',
             fsPath: nativePath,
-            toString() { return `https://${this.authority}${this.path}`; },
+            toString() { return `https://${this.authority}${encodeWebviewResourcePath(this.path)}`; },
             with(change) { return { ...this, ...change }; },
             toJSON() { return { scheme: this.scheme, authority: this.authority, path: this.path }; },
           };
@@ -2438,6 +2479,7 @@ function createVscodeShim() {
   host._onDocumentCloseEvent = new VscEventEmitter();
   host._onDocumentSaveEvent = new VscEventEmitter();
   host._onConfigChangeEvent = new VscEventEmitter();
+  host._onWorkspaceFoldersChangeEvent = new VscEventEmitter();
   host._onDiagnosticsChangeEvent = new VscEventEmitter();
   host._onActiveEditorChangeEvent = new VscEventEmitter();
   host._onVisibleEditorsChangeEvent = new VscEventEmitter();
@@ -2895,7 +2937,8 @@ function createVscodeShim() {
     onDidSaveTextDocument: (listener, thisArg, disposables) =>
       host._onDocumentSaveEvent.event(listener, thisArg, disposables),
     onWillSaveTextDocument: noopEvent,
-    onDidChangeWorkspaceFolders: noopEvent,
+    onDidChangeWorkspaceFolders: (listener, thisArg, disposables) =>
+      host._onWorkspaceFoldersChangeEvent.event(listener, thisArg, disposables),
     onDidCreateFiles: noopEvent,
     onDidDeleteFiles: noopEvent,
     onDidRenameFiles: noopEvent,
@@ -2914,16 +2957,26 @@ function createVscodeShim() {
       const onChange = new VscEventEmitter();
       const onDelete = new VscEventEmitter();
       host._fileWatchers.set(id, { pattern, base, onCreate, onChange, onDelete });
-      const watchPaths = (host._workspaceFolders.length > 0 ? host._workspaceFolders : [base || process.cwd()]).filter(
-        Boolean,
-      );
-      host.emit('event', {
-        type: 'startFileWatch',
-        watcherId: id,
-        paths: watchPaths,
-        pattern,
-        recursive: pattern.includes('**'),
-      });
+      let watchBase = base;
+      // RelativePattern can target a directory that has not been created yet.
+      // Watch its nearest existing ancestor, but retain the original base for
+      // event filtering on both sides of the bridge.
+      while (watchBase && !fs.existsSync(watchBase)) {
+        const parent = path.dirname(watchBase);
+        if (parent === watchBase) break;
+        watchBase = parent;
+      }
+      const watchPaths = (base ? [watchBase] : host._workspaceFolders).filter(Boolean);
+      if (watchPaths.length) {
+        host.emit('event', {
+          type: 'startFileWatch',
+          watcherId: id,
+          paths: watchPaths,
+          pattern,
+          base,
+          recursive: watchBase !== base || pattern.includes('**') || pattern.includes('/'),
+        });
+      }
       return {
         onDidCreate: ignoreCreateEvents ? noopEvent : onCreate.event,
         onDidChange: ignoreChangeEvents ? noopEvent : onChange.event,
@@ -3744,7 +3797,7 @@ function createVscodeShim() {
               query: localUri.query || '',
               fragment: localUri.fragment || '',
               fsPath: nativePath,
-              toString() { return `https://${this.authority}${this.path}`; },
+              toString() { return `https://${this.authority}${encodeWebviewResourcePath(this.path)}`; },
               with(change) { return { ...this, ...change }; },
               toJSON() { return { scheme: this.scheme, authority: this.authority, path: this.path }; },
             };
@@ -5010,6 +5063,9 @@ function installVscodeShim() {
 
 installVscodeShim();
 hostInstance = new ExtensionHost();
+if (typeof process.send === 'function') {
+  shutdownHost = installProcessCleanup(() => hostInstance.shutdown(), { ipc: true });
+}
 const _vscodeShim = createVscodeShim();
 globalThis.__sidex_vscode_shim__ = _vscodeShim;
 require.cache['__sidex_vscode_shim__'].exports = _vscodeShim;
@@ -5017,13 +5073,12 @@ require.cache['__sidex_vscode_shim__'].exports = _vscodeShim;
 try {
   const { register } = require('module');
   if (typeof register === 'function') {
-    const hostCjsPath = path.resolve(__dirname, 'host.cjs');
     const shimExports = require.cache['__sidex_vscode_shim__']?.exports;
     const namedKeys = shimExports ? Object.keys(shimExports).filter(k => k !== 'default' && k !== '__esModule') : [];
     const esmLines = [
       `import { createRequire } from 'node:module';`,
       `import { fileURLToPath } from 'node:url';`,
-      `const _require = createRequire(${JSON.stringify(hostCjsPath)});`,
+      `const _require = createRequire(import.meta.url);`,
       `const _shim = globalThis.__sidex_vscode_shim__ || _require('__sidex_vscode_shim__');`,
       `export default _shim;`,
       ...namedKeys.map(k => `export const ${k} = _shim.${k};`),
@@ -5151,9 +5206,7 @@ if (process.env.SIDEX_EXTENSION_HOST === 'true' && process.send) {
   }, 500);
 
   host.on('event', (event) => {
-    if (process.send) {
-      process.send({ type: 'sidex:host-event', event });
-    }
+    sendHostMessage({ type: 'sidex:host-event', event });
   });
 
   process.on('message', (msg) => {
@@ -5162,14 +5215,14 @@ if (process.env.SIDEX_EXTENSION_HOST === 'true' && process.send) {
     const reply = host.handleMessage(msg);
     if (reply && typeof reply.then === 'function') {
       reply.then((r) => {
-        if (r && process.send) process.send({ type: 'sidex:host-reply', reply: r });
+        if (r) sendHostMessage({ type: 'sidex:host-reply', reply: r });
       }).catch(() => {});
-    } else if (reply && process.send) {
-      process.send({ type: 'sidex:host-reply', reply });
+    } else if (reply) {
+      sendHostMessage({ type: 'sidex:host-reply', reply });
     }
   });
 
-  process.send({ type: 'VSCODE_EXTHOST_IPC_READY' });
+  sendHostMessage({ type: 'VSCODE_EXTHOST_IPC_READY' });
   log('extension host process running in IPC mode');
 } else {
   module.exports = hostInstance;

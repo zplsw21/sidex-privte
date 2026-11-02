@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "targets": [
+      "app"
+    ],
+    "resources": {
+      "extension-host/": "extension-host/",
+      "shell-integration/": "shell-integration/",
+      "../extensions/": "extensions/",
+      "../local-build/node/bin/node": "node/bin/node"
+    },
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  },
+  "identifier": "com.siden.sidex"
+}

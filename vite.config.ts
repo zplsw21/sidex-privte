@@ -47,9 +47,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index: path.resolve(__dirname, 'index.html'),
-        textMateWorker: path.resolve(__dirname, 'src/vs/workbench/services/textMate/browser/backgroundTokenization/worker/textMateTokenizationWorker.workerMain.ts'),
-        editorWorker: path.resolve(__dirname, 'src/vs/editor/common/services/editorWebWorkerMain.ts'),
-        extensionHostWorker: path.resolve(__dirname, 'src/vs/workbench/api/worker/extensionHostWorkerMain.ts'),
         // Force the NLS runtime (localize/localize2) into its own chunk so it
         // loads first and has its global translation tables in place before any
         // module evaluates `localize()` at top-level module scope.
@@ -57,15 +54,6 @@ export default defineConfig({
       },
       output: {
         entryFileNames: (chunkInfo) => {
-          if (chunkInfo.name === 'editorWorker') {
-            return 'assets/editorWorker.js';
-          }
-          if (chunkInfo.name === 'textMateWorker') {
-            return 'assets/textMateWorker.js';
-          }
-          if (chunkInfo.name === 'extensionHostWorker') {
-            return 'assets/extensionHostWorker.js';
-          }
           if (chunkInfo.name === 'nls') {
             return 'assets/nls.js';
           }
@@ -79,25 +67,7 @@ export default defineConfig({
           }
           return 'assets/[name]-[hash][extname]';
         },
-        manualChunks(id, { getModuleInfo }) {
-          const isWorkerDep = (moduleId: string, visited = new Set<string>()): boolean => {
-            if (visited.has(moduleId)) return false;
-            visited.add(moduleId);
-            const info = getModuleInfo(moduleId);
-            if (!info) return false;
-            if (info.isEntry && (moduleId.includes('WorkerMain') || moduleId.includes('workerMain'))) {
-              return true;
-            }
-            for (const importer of info.importers) {
-              if (isWorkerDep(importer, visited)) return true;
-            }
-            return false;
-          };
-
-          if (isWorkerDep(id)) {
-            return undefined;
-          }
-
+        manualChunks(id) {
           if (id.endsWith('/vs/nls.ts') || id.endsWith('/vs/nls.js')) {
             return 'nls';
           }
@@ -123,6 +93,7 @@ export default defineConfig({
     exclude: ['@tauri-apps/api'],
   },
   worker: {
+    // Build worker imports separately so browser-only core/NLS chunks never run in workers.
     format: 'es',
     rollupOptions: {
       output: {

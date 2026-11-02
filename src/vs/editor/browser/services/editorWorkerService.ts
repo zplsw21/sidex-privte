@@ -6,7 +6,7 @@
 import { timeout } from '../../../base/common/async.js';
 import { Disposable, IDisposable } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
-import { logOnceWebWorkerWarning, IWebWorkerClient, Proxied } from '../../../base/common/worker/webWorker.js';
+import { logOnceWebWorkerWarning, IWebWorkerClient, Proxied, WorkerTransportError } from '../../../base/common/worker/webWorker.js';
 import { WebWorkerDescriptor } from '../../../platform/webWorker/browser/webWorkerDescriptor.js';
 import { IWebWorkerService } from '../../../platform/webWorker/browser/webWorkerService.js';
 import { Position } from '../../common/core/position.js';
@@ -18,6 +18,7 @@ import { EditorWorker } from '../../common/services/editorWebWorker.js';
 import {
 	DiffAlgorithmName,
 	IEditorWorkerService,
+	IDiffComputationResult,
 	ILineChange,
 	IUnicodeHighlightsResult
 } from '../../common/services/editorWorker.js';
@@ -142,8 +143,22 @@ export class EditorWorkerService extends Disposable implements IEditorWorkerServ
 		options: IDocumentDiffProviderOptions,
 		algorithm: DiffAlgorithmName
 	): Promise<IDocumentDiff | null> {
-		const worker = await this._workerWithResources([original, modified], /* forceLargeModels */ true);
-		const result = await worker.$computeDiff(original.toString(), modified.toString(), options, algorithm);
+		let worker = await this._workerWithResources([original, modified], /* forceLargeModels */ true);
+		let result: IDiffComputationResult | null;
+		try {
+			result = await worker.$computeDiff(original.toString(), modified.toString(), options, algorithm);
+		} catch (error) {
+			if (!(error instanceof WorkerTransportError)) {
+				throw error;
+			}
+			if (this._store.isDisposed) {
+				throw canceled();
+			}
+			// Reacquiring the failed worker selects the existing local fallback
+			// and resynchronizes both models. Retry this interrupted RPC only once.
+			worker = await this._workerWithResources([original, modified], /* forceLargeModels */ true);
+			result = await worker.$computeDiff(original.toString(), modified.toString(), options, algorithm);
+		}
 		if (!result) {
 			return null;
 		}
@@ -566,14 +581,27 @@ export class EditorWorkerClient extends Disposable implements IEditorWorkerClien
 	}
 
 	protected async _getProxy(): Promise<Proxied<EditorWorker>> {
+		const worker = this._getOrCreateWorker();
 		try {
-			const proxy = this._getOrCreateWorker().proxy;
+			const proxy = worker.proxy;
 			await proxy.$ping();
 			return proxy;
 		} catch (err) {
+			if (this._disposed) {
+				throw canceled();
+			}
 			logOnceWebWorkerWarning(err);
-			this._worker = this._createFallbackLocalWorker();
-			return this._worker.proxy;
+			// Several callers can fail on the same worker. Only the first may
+			// replace it, so every caller uses the same mirrored models.
+			if (this._worker === worker) {
+				worker.dispose();
+				// A model manager bound to the failed transport cannot sync the
+				// replacement local worker's mirror models.
+				this._modelManager?.dispose();
+				this._modelManager = null;
+				this._worker = this._createFallbackLocalWorker();
+			}
+			return this._worker!.proxy;
 		}
 	}
 

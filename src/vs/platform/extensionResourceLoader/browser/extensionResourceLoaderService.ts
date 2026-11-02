@@ -48,7 +48,8 @@ class ExtensionResourceLoaderService extends AbstractExtensionResourceLoaderServ
 			uri.scheme !== Schemas.http &&
 			uri.scheme !== Schemas.https &&
 			uri.scheme !== Schemas.data &&
-			uri.scheme !== Schemas.tauri
+			uri.scheme !== Schemas.tauri &&
+			uri.scheme !== 'sidex-asset'
 		) {
 			const result = await this._fileService.readFile(uri);
 			return result.value.toString();

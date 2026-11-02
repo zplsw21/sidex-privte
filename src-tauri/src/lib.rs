@@ -475,7 +475,7 @@ pub fn run() {
             WasmExtensionRuntime::new().expect("failed to initialize WASM runtime"),
         ))
         .register_asynchronous_uri_scheme_protocol("sidex-asset", |_ctx, request, responder| {
-            std::thread::spawn(move || {
+            tauri::async_runtime::spawn_blocking(move || {
                 let raw_path = request.uri().path();
                 let decoded = urlencoding::decode(raw_path.strip_prefix('/').unwrap_or(raw_path))
                     .unwrap_or_default();
@@ -1035,6 +1035,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app_handle, event| {
+            // macOS can keep the application alive after its last window
+            // closes. Stop that window's extension tree as well as on Quit.
+            let last_window_closed = matches!(
+                event,
+                tauri::RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                }
+            ) && app_handle.webview_windows().is_empty();
+            if last_window_closed {
+                if let Some(supervisor) = app_handle.try_state::<ExtensionPlatformSupervisor>() {
+                    let _ = supervisor.stop();
+                }
+            }
             // Kill every child process we spawned when the app exits —
             // PTY shells, build tasks, debug adapters, and the extension
             // host would otherwise outlive the editor as orphans.

@@ -136,20 +136,18 @@ pub fn modify_jsonc(input: &str, path: &[&str], value: &Value) -> Result<String>
 // --- helpers ---
 
 fn skip_string(b: &[u8], mut i: usize, out: &mut String) -> usize {
+    let start = i;
     while i < b.len() {
         if b[i] == b'\\' && i + 1 < b.len() {
-            out.push(b[i] as char);
-            out.push(b[i + 1] as char);
             i += 2;
         } else if b[i] == b'"' {
-            out.push('"');
             i += 1;
             break;
         } else {
-            out.push(b[i] as char);
             i += 1;
         }
     }
+    out.push_str(std::str::from_utf8(&b[start..i]).expect("JSONC input is UTF-8"));
     i
 }
 
@@ -434,5 +432,35 @@ mod tests {
             parse_jsonc("{\n /* o /* i */ s */\n \"a\":1\n}").unwrap()["a"],
             1
         );
+    }
+    #[test]
+    fn unicode_keys_paths_comments_and_escapes_are_preserved() {
+        let input = r#"{
+            // 中文行注释
+            "路径": "/tmp/中文-📚/书籍.txt",
+            /* 中文块注释 */ "quoted": "中文\"转义\\路径 // /* 文本 */",
+            "escaped": "\u4e2d\u6587\ud83d\udcda",
+            "nested": ["日本語", "é",],
+        }"#;
+        let (value, comments) = parse_jsonc_with_comments(input).unwrap();
+        assert_eq!(value["路径"], "/tmp/中文-📚/书籍.txt");
+        assert_eq!(value["quoted"], "中文\"转义\\路径 // /* 文本 */");
+        assert_eq!(value["escaped"], "中文📚");
+        assert_eq!(value["nested"][0], "日本語");
+        assert_eq!(value["nested"][1], "é");
+        assert_eq!(comments[0].text, "中文行注释");
+        assert_eq!(comments[1].text, "中文块注释");
+        assert_eq!(strip_comments(input).lines().count(), input.lines().count());
+        assert_eq!(parse_jsonc(&format_jsonc(&value, 2)).unwrap(), value);
+
+        let changed = modify_jsonc(input, &["路径"], &Value::from("/tmp/新书-📚.txt")).unwrap();
+        assert!(changed.contains("中文行注释"));
+        assert_eq!(parse_jsonc(&changed).unwrap()["路径"], "/tmp/新书-📚.txt");
+        assert_eq!(parse_jsonc(&changed).unwrap()["quoted"], value["quoted"]);
+    }
+    #[test]
+    fn invalid_escape_before_unicode_returns_an_error() {
+        assert!(parse_jsonc(r#"{"key":"\中"}"#).is_err());
+        assert!(parse_jsonc(r#"{"key":"中文\"}"#).is_err());
     }
 }

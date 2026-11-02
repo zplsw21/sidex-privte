@@ -4,7 +4,7 @@
 		<meta http-equiv="Content-Security-Policy" content="
 			default-src 'none';
 			child-src 'self' data: blob:;
-			script-src 'self' 'unsafe-eval' 'sha256-cl8ijlOzEe+0GRCQNJQu2k6nUQ0fAYNYIuuKEm72JDs=' https: http://localhost:* blob:;
+			script-src 'self' 'unsafe-eval' 'sha256-bTfwWpFQz6EX7yrRnQzI2qb/CDpx/wuaAxIxyrt6fF8=' https: http://localhost:* blob:;
 			connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;"/>
 	</head>
 	<body>
@@ -80,7 +80,7 @@
 				return;
 			}
 			const { data } = event.data;
-			createWorker(data.workerUrl, data.fileRoot, data.nls.messages, data.nls.language);
+			createWorker(data.workerUrl, data.fileRoot, data.nls.messages, data.nls.language, data.nls.translations);
 		};
 
 		window.parent.postMessage({
@@ -89,7 +89,7 @@
 		}, '*');
 	}
 
-	function createWorker(workerUrl, fileRoot, nlsMessages, nlsLanguage) {
+	function createWorker(workerUrl, fileRoot, nlsMessages, nlsLanguage, nlsTranslations) {
 		try {
 			if (globalThis.crossOriginIsolated) {
 				workerUrl += '?vscode-coi=2'; // COEP
@@ -102,6 +102,7 @@
 			const blob = new Blob([[
 				`/*extensionHostWorker*/`,
 				`globalThis._VSCODE_NLS_MESSAGES = ${JSON.stringify(nlsMessages)};`,
+				`globalThis._VSCODE_NLS_TRANSLATIONS = ${JSON.stringify(nlsTranslations)};`,
 				`globalThis._VSCODE_NLS_LANGUAGE = ${JSON.stringify(nlsLanguage)};`,
 				`globalThis._VSCODE_FILE_ROOT = ${JSON.stringify(fileRoot)};`,
 				`await import(${JSON.stringify(workerUrl)});`,

@@ -102,6 +102,9 @@ export async function loadNlsMessages(): Promise<void> {
 			}
 		}
 
+		// Independently bundled workers keep string keys instead of the main bundle's indices.
+		globalThis._VSCODE_NLS_TRANSLATIONS = translations;
+
 		const indexRes = await fetch('/nls.messages.json');
 		if (indexRes.ok) {
 			const contentType = indexRes.headers.get('content-type') ?? '';
@@ -116,7 +119,6 @@ export async function loadNlsMessages(): Promise<void> {
 			}
 		}
 
-		(globalThis as any)._VSCODE_NLS_TRANSLATIONS = translations;
 		(globalThis as any)._VSCODE_NLS_LANGUAGE = locale;
 		console.log(`[SideX NLS] Loaded ${Object.keys(translations).length} translations for ${locale} (key mode)`);
 	} catch (e) {

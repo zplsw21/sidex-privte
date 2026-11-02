@@ -1,4 +1,13 @@
-import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+import { KeybindingParser } from '../../../../base/common/keybindingParser.js';
+import { KeyCodeChord } from '../../../../base/common/keybindings.js';
+import { KeyChord, KeyMod } from '../../../../base/common/keyCodes.js';
+import { isMacintosh, isWindows } from '../../../../base/common/platform.js';
+import { MenuRegistry } from '../../../../platform/actions/common/actions.js';
+import { KeybindingsRegistry, KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
+import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import type { IWorkbenchContribution } from '../../../common/contributions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
@@ -49,6 +58,8 @@ import {
 } from '../../../../editor/common/languages.js';
 import type { LanguageSelector } from '../../../../editor/common/languageSelector.js';
 import { URI } from '../../../../base/common/uri.js';
+import { match as matchGlob } from '../../../../base/common/glob.js';
+import { isAbsolute } from '../../../../base/common/path.js';
 import { Range } from '../../../../editor/common/core/range.js';
 import {
 	bootstrapExtensionPlatform,
@@ -166,6 +177,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	private _failureBurstLog = new Map<string, number>();
 
 	private _bootstrapExtensions: IExtensionManifestSummary[] = [];
+	private _extensionConfigurationDefaults = new Map<string, unknown>();
 	private _statusBarItems = new Map<string, IStatusbarEntryAccessor>();
 	private _webviewPanels = new Map<string, WebviewInput>();
 	private _treeViews = new Map<string, TreeView>();
@@ -198,6 +210,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		@IWebviewViewService private readonly webviewViewService: IWebviewViewService,
 		@IWebviewService private readonly webviewService: IWebviewService,
 		@ICodeEditorService private readonly codeEditorService: ICodeEditorService,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super();
 		this._init();
@@ -281,6 +294,12 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 
 	private _applyBootstrap(bootstrap: IExtensionPlatformBootstrap): void {
 		this._bootstrapExtensions = bootstrap.extensions || [];
+		this._registerManifestContributions(bootstrap.initDataJson);
+		this._register(this.configurationService.onDidChangeConfiguration(event => {
+			if ([...this._extensionConfigurationDefaults.keys()].some(key => event.affectsConfiguration(key))) {
+				this._syncExtensionConfiguration();
+			}
+		}));
 
 		const wasmExtensions = this._bootstrapExtensions.filter(e => e.kind === 'wasm');
 		if (wasmExtensions.length > 0) {
@@ -302,6 +321,78 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		}
 
 		this._syncDocumentsToWasm();
+	}
+
+	private _registerManifestContributions(initDataJson: string): void {
+		let extensions: any[];
+		try {
+			extensions = JSON.parse(initDataJson).extensions || [];
+		} catch {
+			return;
+		}
+		const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
+		for (const extension of extensions) {
+			const manifest = extension.packageJson || extension.packageJSON;
+			const contributes = manifest?.contributes || {};
+			const configurations = Array.isArray(contributes.configuration) ? contributes.configuration : [contributes.configuration];
+			for (const configuration of configurations) {
+				if (!configuration?.properties) { continue; }
+				const properties: any = {};
+				for (const [key, schema] of Object.entries<any>(configuration.properties)) {
+					this._extensionConfigurationDefaults.set(key, schema.default);
+					if (!configurationRegistry.getConfigurationProperties()[key]) {
+						properties[key] = schema;
+					}
+				}
+				if (Object.keys(properties).length) {
+					const node = configurationRegistry.registerConfiguration({ ...configuration, properties });
+					this._register(toDisposable(() => configurationRegistry.deregisterConfigurations([node])));
+				}
+			}
+			for (const command of contributes.commands || []) {
+				if (!command.command) { continue; }
+				this._onCommandRegistered(command.command);
+				if (!MenuRegistry.getCommand(command.command)) {
+					this._register(MenuRegistry.addCommand({
+						id: command.command,
+						title: command.title || command.command,
+						category: command.category,
+						precondition: ContextKeyExpr.deserialize(command.enablement),
+					}));
+				}
+			}
+			const bindings = Array.isArray(contributes.keybindings) ? contributes.keybindings : [contributes.keybindings];
+			for (const [index, binding] of bindings.entries()) {
+				if (!binding?.command) { continue; }
+				const key = (isMacintosh ? binding.mac : isWindows ? binding.win : binding.linux) ?? binding.key;
+				const parsed = typeof key === 'string' ? KeybindingParser.parseKeybinding(key) : null;
+				if (!parsed || parsed.chords.length > 2 || parsed.chords.some(chord => !(chord instanceof KeyCodeChord))) { continue; }
+				const chords = parsed.chords.map(chord => {
+					const codeChord = chord as KeyCodeChord;
+					return codeChord.keyCode
+						| ((isMacintosh ? codeChord.metaKey : codeChord.ctrlKey) ? KeyMod.CtrlCmd : 0)
+						| ((isMacintosh ? codeChord.ctrlKey : codeChord.metaKey) ? KeyMod.WinCtrl : 0)
+						| (codeChord.shiftKey ? KeyMod.Shift : 0)
+						| (codeChord.altKey ? KeyMod.Alt : 0);
+				});
+				this._register(KeybindingsRegistry.registerKeybindingRule({
+					id: binding.command,
+					primary: chords.length === 2 ? KeyChord(chords[0], chords[1]) : chords[0],
+					weight: (extension.isBuiltin ? KeybindingWeight.BuiltinExtension : KeybindingWeight.ExternalExtension) + index,
+					when: ContextKeyExpr.and(MenuRegistry.getCommand(binding.command)?.precondition, ContextKeyExpr.deserialize(binding.when)),
+					args: binding.args,
+				}));
+			}
+		}
+	}
+
+	private _syncExtensionConfiguration(): void {
+		const settings: Record<string, unknown> = {};
+		for (const [key, defaultValue] of this._extensionConfigurationDefaults) {
+			const value = this.configurationService.getValue(key);
+			settings[key] = value === undefined ? defaultValue : value;
+		}
+		this._send({ id: this._nextId(), type: 'setConfiguration', params: { settings } });
 	}
 
 	private _wasmDocSyncInitialized = false;
@@ -556,6 +647,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 					.filter(uri => uri.scheme === 'file')
 					.map(uri => uri.fsPath);
 				this._send({ id: this._nextId(), type: 'initialize', params: { extensionPaths: [], workspaceFolders } });
+				this._syncExtensionConfiguration();
 				this._syncOpenDocuments();
 				this._syncActiveEditor();
 				this._startEditorTracking();
@@ -575,10 +667,12 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				this._handshakeSeen = false;
 				this._capabilitiesQueried = false;
 				this._rejectPending('connection closed');
+				this._clearFileWatches();
 				this._scheduleReconnect();
 			};
 
 			window.addEventListener('beforeunload', () => {
+				this._clearFileWatches();
 				if (this._ws?.readyState === WebSocket.OPEN) {
 					this._ws.close(1000, 'page-unload');
 					this._ws = undefined;
@@ -640,9 +734,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 		this._tauriWatchListenerPromise = undefined;
 		clearTimeout(this._capabilityRetryTimer);
 		this._capabilityRetryTimer = undefined;
-		for (const [watcherId] of this._activeWatches) {
-			this._onStopFileWatch(watcherId);
-		}
+		this._clearFileWatches();
 		super.dispose();
 	}
 
@@ -711,7 +803,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 
 	private _handleMessage(msg: any): void {
 		if (msg.type === 'statusBarItemShow' || msg.type === 'statusBarItemUpdate') {
-			this.logService.info(`[ExtHost] RECV ${msg.type}: id=${msg.id} text="${msg.text}"`);
+			this.logService.info(`[ExtHost] RECV ${msg.type}: id=${msg.id}`);
 		}
 		if (msg.id !== undefined && this._pendingCallbacks.has(msg.id)) {
 			const cb = this._pendingCallbacks.get(msg.id)!;
@@ -762,7 +854,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				this._onLanguageConfigurationChanged(msg.language, msg.configuration);
 				break;
 			case 'startFileWatch':
-				this._onStartFileWatch(msg.watcherId, msg.paths, msg.pattern, msg.recursive);
+				this._onStartFileWatch(msg.watcherId, msg.paths, msg.pattern, msg.recursive, msg.base);
 				break;
 			case 'stopFileWatch':
 				this._onStopFileWatch(msg.watcherId);
@@ -2504,12 +2596,22 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	}
 
 
-	private _activeWatches = new Map<number, number>(); // watcherId → Tauri watch_id
+	private _activeWatches = new Map<number, { tauriWatchId: number | undefined; paths: string[]; pattern: string; base: string }>();
 	private _tauriWatchUnlisten: (() => void) | undefined;
 
-	private async _onStartFileWatch(watcherId: number, paths: string[], pattern: string, recursive: boolean): Promise<void> {
+	private async _onStartFileWatch(watcherId: number, paths: string[], pattern: string, recursive: boolean, base = ''): Promise<void> {
+		if (!paths.length || !this._connected) {
+			return;
+		}
+		void this._onStopFileWatch(watcherId);
+		// Register before the first await so stop/disconnect can cancel an in-flight start.
+		const watch = { tauriWatchId: undefined as number | undefined, paths, pattern, base };
+		this._activeWatches.set(watcherId, watch);
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
+			if (this._activeWatches.get(watcherId) !== watch) {
+				return;
+			}
 
 			let fileExtensions: string[] | undefined;
 			const extMatch = pattern.match(/\*\.(\w+)$/);
@@ -2527,7 +2629,11 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 					emit_content: false,
 				},
 			});
-			this._activeWatches.set(watcherId, tauriWatchId);
+			if (this._activeWatches.get(watcherId) !== watch || !this._connected) {
+				await invoke('watch_stop', { id: tauriWatchId });
+				return;
+			}
+			watch.tauriWatchId = tauriWatchId;
 			this.logService.info(`[ExtHost] File watch ${watcherId} started (tauri=${tauriWatchId}) for ${pattern}`);
 
 			if (!this._tauriWatchUnlisten && !this._tauriWatchListenerPromise) {
@@ -2538,25 +2644,37 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 			}
 			await this._tauriWatchListenerPromise;
 		} catch (e) {
+			if (this._activeWatches.get(watcherId) === watch) {
+				this._activeWatches.delete(watcherId);
+			}
 			this.logService.warn(`[ExtHost] Failed to start file watch for ${pattern}:`, e);
 		}
 	}
 
 	private async _onStopFileWatch(watcherId: number): Promise<void> {
-		const tauriWatchId = this._activeWatches.get(watcherId);
-		if (tauriWatchId === undefined) {
+		const watch = this._activeWatches.get(watcherId);
+		if (!watch) {
 			return;
 		}
 		this._activeWatches.delete(watcherId);
+		if (watch.tauriWatchId === undefined) {
+			return;
+		}
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
-			await invoke('watch_stop', { id: tauriWatchId });
+			await invoke('watch_stop', { id: watch.tauriWatchId });
 			this.logService.info(`[ExtHost] File watch ${watcherId} stopped`);
 		} catch {
 			// best-effort cleanup
 		}
 	}
 
+
+	private _clearFileWatches(): void {
+		for (const [watcherId] of this._activeWatches) {
+			void this._onStopFileWatch(watcherId);
+		}
+	}
 
 	private _toWorkbenchAlignment(apiAlignment: number): StatusbarAlignment {
 		return apiAlignment === 2 ? StatusbarAlignment.RIGHT : StatusbarAlignment.LEFT;
@@ -2573,7 +2691,7 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 	}
 
 	private _onStatusBarItemShow(msg: any): void {
-		this.logService.info(`[ExtHost] statusBarItemShow: id=${msg.id} text="${msg.text}" alignment=${msg.alignment} priority=${msg.priority}`);
+		this.logService.info(`[ExtHost] statusBarItemShow: id=${msg.id} alignment=${msg.alignment} priority=${msg.priority}`);
 		const existing = this._statusBarItems.get(msg.id);
 		if (existing) {
 			existing.update(this._makeStatusbarEntry(msg));
@@ -2905,12 +3023,28 @@ class TauriExtensionHostContribution extends Disposable implements IWorkbenchCon
 				if (!this._connected) {
 					return;
 				}
-				this._send({
-					id: this._nextId(),
-					type: 'fileWatchEvent',
-					params: { events: event.payload.events },
-				});
+				for (const [watcherId, watch] of this._activeWatches) {
+					if (watch.tauriWatchId !== event.payload.watch_id) {
+						continue;
+					}
+					const bases = watch.base ? [watch.base] : watch.paths;
+					const absolutePattern = !watch.base && isAbsolute(watch.pattern) ? watch.pattern : undefined;
+					const events = event.payload.events.filter(change =>
+						bases.some(base => matchGlob({ base, pattern: absolutePattern ? '**' : watch.pattern }, change.path))
+						&& (!absolutePattern || matchGlob(absolutePattern, change.path)));
+					if (events.length) {
+						this._send({
+							id: this._nextId(),
+							type: 'fileWatchEvent',
+							params: { watcherId, events },
+						});
+					}
+				}
 			});
+			if (!this._connected) {
+				unlisten();
+				return;
+			}
 			this._tauriWatchUnlisten = unlisten;
 		} catch (e) {
 			this.logService.warn('[ExtHost] Failed to setup Tauri watch listener:', e);

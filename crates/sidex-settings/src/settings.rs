@@ -56,8 +56,15 @@ impl Settings {
 
     /// Load user-level settings from a `settings.json` file (JSONC).
     pub fn load_user(&mut self, path: &Path) -> Result<()> {
-        let contents =
-            std::fs::read_to_string(path).context("failed to read user settings file")?;
+        let contents = std::fs::read_to_string(path)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok("{}".to_owned())
+                } else {
+                    Err(error)
+                }
+            })
+            .context("failed to read user settings file")?;
         let parsed = parse_jsonc(&contents)?;
         let old_layer = std::mem::replace(&mut self.user_layer, parsed);
         self.fire_changes(&old_layer, &self.user_layer.clone());

@@ -833,6 +833,18 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 
 	private async scanInstalledExtensions(profileLocation: URI, scanOptions?: ScanOptions): Promise<IScannedExtension[]> {
 		let installedExtensions = await this.readInstalledExtensions(profileLocation);
+		const localExtensions = new Map<string, { version: string; path: string }>();
+		if ((globalThis as any).__SIDEX_TAURI__ === true) {
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				const installed = await invoke<{ id: string; version: string; path: string }[]>('list_installed_extensions');
+				for (const extension of installed) {
+					localExtensions.set(extension.id.toLowerCase(), extension);
+				}
+			} catch (error) {
+				this.logService.warn('Unable to resolve local extension resources', error);
+			}
+		}
 
 		// If current profile is not a default profile, then add the application extensions to the list
 		if (
@@ -863,7 +875,13 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 			if (existing && semver.gt(existing.manifest.version, webExtension.version)) {
 				continue;
 			}
-			const extension = await this.toScannedExtension(webExtension, false);
+			let extension = await this.toScannedExtension(webExtension, false);
+			const local = localExtensions.get(extension.identifier.id.toLowerCase());
+			if (local?.path && local.version === extension.manifest.version
+				&& (extension.location.scheme === 'http' || extension.location.scheme === 'https')) {
+				// Use installed assets: gallery SVG responses may not have an image MIME type.
+				extension = { ...extension, location: URI.file(local.path) };
+			}
 			if (extension.isValid || !scanOptions?.skipInvalidExtensions) {
 				result.set(extension.identifier.id.toLowerCase(), extension);
 			} else {

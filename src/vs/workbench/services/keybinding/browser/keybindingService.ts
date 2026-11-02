@@ -272,6 +272,7 @@ export class WorkbenchKeybindingService extends AbstractKeybindingService {
 				this.updateResolver();
 			})
 		);
+		this._register(KeybindingsRegistry.onDidChange(() => this.updateResolver()));
 
 		keybindingsExtPoint.setHandler(extensions => {
 			const keybindings: IExtensionKeybindingRule[] = [];
@@ -286,7 +287,6 @@ export class WorkbenchKeybindingService extends AbstractKeybindingService {
 			}
 
 			KeybindingsRegistry.setExtensionKeybindings(keybindings);
-			this.updateResolver();
 		});
 
 		this.updateKeybindingsJsonSchema();

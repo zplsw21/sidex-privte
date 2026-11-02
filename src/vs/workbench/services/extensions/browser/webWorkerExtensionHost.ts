@@ -200,6 +200,7 @@ export class WebWorkerExtensionHost extends Disposable implements IExtensionHost
 						fileRoot: globalThis._VSCODE_FILE_ROOT,
 						nls: {
 							messages: getNLSMessages(),
+							translations: globalThis._VSCODE_NLS_TRANSLATIONS,
 							language: getNLSLanguage()
 						}
 					}

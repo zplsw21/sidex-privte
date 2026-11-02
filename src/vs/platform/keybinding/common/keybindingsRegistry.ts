@@ -10,6 +10,7 @@ import { ContextKeyExpression } from '../../contextkey/common/contextkey.js';
 import { Registry } from '../../registry/common/platform.js';
 import { combinedDisposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { LinkedList } from '../../../base/common/linkedList.js';
+import { Emitter, Event } from '../../../base/common/event.js';
 
 export interface IKeybindingItem {
 	keybinding: Keybinding | null;
@@ -73,6 +74,7 @@ export interface ICommandAndKeybindingRule<Args extends unknown[] = unknown[]> e
 }
 
 export interface IKeybindingsRegistry {
+	readonly onDidChange: Event<void>;
 	registerKeybindingRule(rule: IKeybindingRule): IDisposable;
 	setExtensionKeybindings(rules: IExtensionKeybindingRule[]): void;
 	registerCommandAndKeybindingRule<Args extends unknown[] = unknown[]>(
@@ -86,6 +88,9 @@ export interface IKeybindingsRegistry {
  * Stores all built-in and extension-provided keybindings (but not ones that user defines themselves)
  */
 class KeybindingsRegistryImpl implements IKeybindingsRegistry {
+	private readonly _onDidChange = new Emitter<void>();
+	readonly onDidChange: Event<void> = this._onDidChange.event;
+
 	private _coreKeybindings: LinkedList<IKeybindingItem>;
 	private _coreKeybindingRules: LinkedList<IKeybindingRule>;
 	private _extensionKeybindings: IKeybindingItem[];
@@ -147,8 +152,10 @@ class KeybindingsRegistryImpl implements IKeybindingsRegistry {
 		result.add(
 			toDisposable(() => {
 				removeRule();
+				this._onDidChange.fire();
 			})
 		);
+		this._onDidChange.fire();
 
 		return result;
 	}
@@ -173,6 +180,7 @@ class KeybindingsRegistryImpl implements IKeybindingsRegistry {
 
 		this._extensionKeybindings = result;
 		this._cachedMergedKeybindings = null;
+		this._onDidChange.fire();
 	}
 
 	public registerCommandAndKeybindingRule(desc: ICommandAndKeybindingRule): IDisposable {

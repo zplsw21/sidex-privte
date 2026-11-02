@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
-use tauri::Manager;
 
 #[derive(Debug, Serialize)]
 pub struct OsInfo {
@@ -85,15 +84,6 @@ pub fn get_user_data_dir(app: tauri::AppHandle) -> Result<String, String> {
     Ok(user_dir.to_string_lossy().to_string())
 }
 
-pub(crate) fn resolve_user_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    #[cfg(target_os = "linux")]
-    if let Some(config_dir) = dirs::config_dir() {
-        return Ok(config_dir.join("SideX").join("UserData"));
-    }
-
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
-    Ok(dir.join("UserData"))
+pub(crate) fn resolve_user_data_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(crate::app_dirs::app_data_dir().join("UserData"))
 }

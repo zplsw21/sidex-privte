@@ -1,0 +1,21 @@
+# Keep local runtimes, app archives, personal backups and verification snapshots local.
+*
+!.gitignore
+!BUILDING.md
+!VALIDATION.md
+!cargo-local.sh
+!tauri.local.json
+!package-extension.py
+!verify-esm-shim.cjs
+!verify-host.cjs
+!verify-keybindings.cjs
+!verify-local-extension-resources.cjs
+
+# These JavaScript files are the extension's source, not disposable build output.
+!thief-book/
+!thief-book/README.md
+!thief-book/package.json
+!thief-book/out/
+!thief-book/out/*.js
+!thief-book/test/
+!thief-book/test/*.cjs
